@@ -226,10 +226,10 @@ jobs:
           # (字符串名, 新的文案)
           edits = [
               ("settings_sucompat_summary",              "适用于su不生效"),
-              ("settings_selinux_hide",                  "隐藏 Selinux 的修改"),
-              ("settings_selinux_hide_summary",          "防止被用户进程检测到修改"),
+              ("settings_selinux_hide",                  "隐藏 Selinux 改动痕迹"),
+              ("settings_selinux_hide_summary",          "防止 Selinux 被用户进程检测到修改"),
               ("enable_web_debugging_summary",           "请在需要时再启用"),
-              ("settings_night_mode_follow_sys",         "深色系统"),
+              ("settings_night_mode_follow_sys",         "深色模式"),
               ("settings_night_mode_follow_sys_summary", "跟随系统"),
               ("settings_use_system_color_theme",        "主题颜色"),
               ("settings_use_system_color_theme_summary","跟随系统"),
