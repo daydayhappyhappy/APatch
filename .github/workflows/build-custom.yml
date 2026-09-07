@@ -5,7 +5,7 @@ name: 编译自定义 APatch
 #   2. 把「包名 + 证书摘要」写进 KernelPatch，编译出定制版 kpimg
 #   3. （可选）把管理器包名改成任意名字
 #   4. 只保留中文语言，检查更新描述改为「自动检测」
-#   5. 去掉设置页里的「语言」入口（中文-only 后已无意义）
+#   5. 精简语言列表：保留入口，只留「跟随系统 / 简体中文」
 #   6. 编译管理器 APK，并用 v2-only 方案重签名
 #   7. 校验 APK 证书摘要与 kpimg 内写死的一致，产出可直接刷机的 APK
 #
@@ -481,59 +481,73 @@ jobs:
           PY
 
       # ---------------------------------------------------------------
-      # 3.7 去掉设置页的「语言」入口
-      #     语言目录已删空，这个入口只剩一长串选了也没用的语言，直接移除
-      #     LanguageDialog 函数体保留（不调用即不渲染），避免 import 变成未使用
+      # 3.7 精简语言列表：保留入口，只留「跟随系统 / 简体中文」
+      #     纯改资源文件、不碰 Kotlin，零编译风险
       #     幂等：重复执行会安全跳过
       # ---------------------------------------------------------------
-      - name: 移除语言选项
+      - name: 精简语言列表
         run: |
           set -euo pipefail
           python3 - <<'PY'
-          import io, re, sys, glob
+          import io, re, sys, glob, os
 
-          # 用 glob 定位，改过包名（目录被重命名）也能找到
-          cands = glob.glob("app/src/main/**/ui/screen/Settings.kt", recursive=True)
-          if not cands:
-              sys.exit("[de-lang] 失败：找不到 Settings.kt")
-          path = cands[0]
-          print("[de-lang] 目标文件: %s" % path)
+          def find():
+              p = os.path.join("app", "src", "main", "res", "values", "arrays.xml")
+              if os.path.isfile(p):
+                  try:
+                      if "languages_values" in io.open(p, encoding="utf-8").read():
+                          return p
+                  except Exception:
+                      pass
+              hits = []
+              for q in glob.glob("app/src/main/res/**/*.xml", recursive=True):
+                  try:
+                      if "languages_values" in io.open(q, encoding="utf-8").read():
+                          hits.append(q)
+                  except Exception:
+                      pass
+              if not hits:
+                  sys.exit("[slim-lang] 失败：全仓找不到 languages_values，上游结构可能已变化")
+              return hits[0]
+
+          path = find()
+          print("[slim-lang] 目标文件: %s" % path)
 
           src = io.open(path, encoding="utf-8").read()
-          orig = src
 
-          # 1. 删除设置页里的「语言」入口 ListItem（从 // language 注释到该 item 结束）
-          pat_item = re.compile(
-              r"[ \t]*// language\n.*?leadingContent = \{ Icon\(Icons\.Filled\.Translate, null\) \}\)\n",
-              re.S)
-          src, n1 = pat_item.subn("", src, count=1)
+          WANT_LANG = ('    <string-array name="languages">\n'
+                       '        <item>@string/system_default</item>\n'
+                       '        <item>简体中文</item>\n'
+                       '    </string-array>')
+          WANT_VAL = ('    <string-array name="languages_values">\n'
+                      '        <item>default</item>\n'
+                      '        <item>zh-CN</item>\n'
+                      '    </string-array>')
 
-          # 2. 删除 LanguageDialog 的调用点（函数体保留，不调用即不渲染）
-          pat_call = re.compile(
-              r"[ \t]*val showLanguageDialog = rememberSaveable \{ mutableStateOf\(false\) \}\n"
-              r"[ \t]*LanguageDialog\(showLanguageDialog\)\n")
-          src, n2 = pat_call.subn("", src, count=1)
+          if WANT_LANG in src and WANT_VAL in src:
+              print("[slim-lang] 已处理过，跳过")
+              sys.exit(0)
 
-          if n1 == 0 or n2 == 0:
-              # 已经处理过 -> 幂等跳过
-              if "Icons.Filled.Translate" not in src and "val showLanguageDialog" not in src:
-                  print("[de-lang] ⏭  已处理过，跳过")
-                  sys.exit(0)
-              sys.exit("[de-lang] 失败：未匹配到目标代码（item=%d call=%d），上游结构可能已变化" % (n1, n2))
+          pat_l = re.compile(r'[ \t]*<string-array name="languages">.*?</string-array>', re.S)
+          pat_v = re.compile(r'[ \t]*<string-array name="languages_values">.*?</string-array>', re.S)
 
-          # 3. 兜底校验（LanguageDialog 函数体内的同名参数不算残留）
-          left = []
-          if "Icons.Filled.Translate" in src:
-              left.append("语言入口 ListItem")
-          if re.search(r"val showLanguageDialog = ", src):
-              left.append("LanguageDialog 调用点")
-          if left:
-              sys.exit("[de-lang] 失败：仍有残留 %s" % left)
+          if not pat_l.search(src) or not pat_v.search(src):
+              sys.exit("[slim-lang] 失败：未匹配到 languages / languages_values，上游结构可能已变化")
 
+          src = pat_l.sub(lambda m: WANT_LANG, src, count=1)
+          src = pat_v.sub(lambda m: WANT_VAL, src, count=1)
           io.open(path, "w", encoding="utf-8", newline="\n").write(src)
-          print("[de-lang] ✅ 已移除设置页「语言」入口（删除 %d 字符）" % (len(orig) - len(src)))
-          PY
 
+          new = io.open(path, encoding="utf-8").read()
+          a = re.findall(r'<string-array name="languages">(.*?)</string-array>', new, re.S)
+          b = re.findall(r'<string-array name="languages_values">(.*?)</string-array>', new, re.S)
+          if len(a) != 1 or len(b) != 1:
+              sys.exit("[slim-lang] 失败：替换后数组数量异常")
+          na, nb = a[0].count("<item>"), b[0].count("<item>")
+          if na != 2 or nb != 2:
+              sys.exit("[slim-lang] 失败：数组长度不为 2（%d/%d），两个数组必须等长" % (na, nb))
+          print("[slim-lang] ✅ 语言列表已精简：languages=%d 项，languages_values=%d 项" % (na, nb))
+          PY
       # ---------------------------------------------------------------
       # 4. 编译管理器 APK
       # ---------------------------------------------------------------
