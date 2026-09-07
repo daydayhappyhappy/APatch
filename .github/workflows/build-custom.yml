@@ -353,7 +353,7 @@ jobs:
               closers = m.group(2) if m.group(2) else "    "
               indent = closers + "    "  # 块内语句比闭合括号多一级缩进
               s = s[:m.start()] + m.group(1) + \
-                  '%slocaleFilters.addAll("zh", "zh-rCN", "zh-rTW")\n%s}' % (indent, closers) + \
+                  '%slocaleFilters.addAll(listOf("zh", "zh-rCN", "zh-rTW"))\n%s}' % (indent, closers) + \
                   s[m.end():]
               write(p, s)
               done("build.gradle.kts 已加 localeFilters（剔除三方库的多语言资源）")
