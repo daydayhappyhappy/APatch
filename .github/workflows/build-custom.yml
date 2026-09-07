@@ -5,8 +5,9 @@ name: 编译自定义 APatch
 #   2. 把「包名 + 证书摘要」写进 KernelPatch，编译出定制版 kpimg
 #   3. （可选）把管理器包名改成任意名字
 #   4. 只保留中文语言，检查更新描述改为「自动检测」
-#   5. 编译管理器 APK，并用 v2-only 方案重签名
-#   6. 校验 APK 证书摘要与 kpimg 内写死的一致，产出可直接刷机的 APK
+#   5. 去掉设置页里的「语言」入口（中文-only 后已无意义）
+#   6. 编译管理器 APK，并用 v2-only 方案重签名
+#   7. 校验 APK 证书摘要与 kpimg 内写死的一致，产出可直接刷机的 APK
 #
 # 触发方式：Actions 页 -> 本工作流 -> Run workflow
 
@@ -477,6 +478,60 @@ jobs:
           print("界面文案修改完成：")
           for name, value in edits:
               print("  %-42s -> %s" % (name, value))
+          PY
+
+      # ---------------------------------------------------------------
+      # 3.7 去掉设置页的「语言」入口
+      #     语言目录已删空，这个入口只剩一长串选了也没用的语言，直接移除
+      #     LanguageDialog 函数体保留（不调用即不渲染），避免 import 变成未使用
+      #     幂等：重复执行会安全跳过
+      # ---------------------------------------------------------------
+      - name: 移除语言选项
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import io, re, sys, glob
+
+          # 用 glob 定位，改过包名（目录被重命名）也能找到
+          cands = glob.glob("app/src/main/**/ui/screen/Settings.kt", recursive=True)
+          if not cands:
+              sys.exit("[de-lang] 失败：找不到 Settings.kt")
+          path = cands[0]
+          print("[de-lang] 目标文件: %s" % path)
+
+          src = io.open(path, encoding="utf-8").read()
+          orig = src
+
+          # 1. 删除设置页里的「语言」入口 ListItem（从 // language 注释到该 item 结束）
+          pat_item = re.compile(
+              r"[ \t]*// language\n.*?leadingContent = \{ Icon\(Icons\.Filled\.Translate, null\) \}\)\n",
+              re.S)
+          src, n1 = pat_item.subn("", src, count=1)
+
+          # 2. 删除 LanguageDialog 的调用点（函数体保留，不调用即不渲染）
+          pat_call = re.compile(
+              r"[ \t]*val showLanguageDialog = rememberSaveable \{ mutableStateOf\(false\) \}\n"
+              r"[ \t]*LanguageDialog\(showLanguageDialog\)\n")
+          src, n2 = pat_call.subn("", src, count=1)
+
+          if n1 == 0 or n2 == 0:
+              # 已经处理过 -> 幂等跳过
+              if "Icons.Filled.Translate" not in src and "val showLanguageDialog" not in src:
+                  print("[de-lang] ⏭  已处理过，跳过")
+                  sys.exit(0)
+              sys.exit("[de-lang] 失败：未匹配到目标代码（item=%d call=%d），上游结构可能已变化" % (n1, n2))
+
+          # 3. 兜底校验（LanguageDialog 函数体内的同名参数不算残留）
+          left = []
+          if "Icons.Filled.Translate" in src:
+              left.append("语言入口 ListItem")
+          if re.search(r"val showLanguageDialog = ", src):
+              left.append("LanguageDialog 调用点")
+          if left:
+              sys.exit("[de-lang] 失败：仍有残留 %s" % left)
+
+          io.open(path, "w", encoding="utf-8", newline="\n").write(src)
+          print("[de-lang] ✅ 已移除设置页「语言」入口（删除 %d 字符）" % (len(orig) - len(src)))
           PY
 
       # ---------------------------------------------------------------
