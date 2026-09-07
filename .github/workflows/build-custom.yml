@@ -5,7 +5,7 @@
 #   4. 只保留中文语言，检查更新描述改为「自动检测」
 #   5. 精简语言列表：保留「跟随系统」入口，只留「中文」
 #   6. 编译管理器 APK，并用 v2-only 方案重签名
-#   7. 校验 APK 证书摘要与 kpimg 内写死的一致，产出可直接刷机的 APK
+#   7. 校验 APK 证书摘要与 kpimg 内写死的一致 + 校验无繁体残留 + 校验文案生效
 #
 # 触发方式：Actions 页 -> 本工作流 -> Run workflow
 
@@ -174,26 +174,31 @@ jobs:
           ls -l "$GITHUB_WORKSPACE/app/src/main/assets/kpimg"
 
       # ---------------------------------------------------------------
-      # 3.6 只保留中文 + 检查更新描述改为「自动检测」（内联脚本，无需额外文件）
+      # STEP-1 中文化 + 覆盖个别文案 + 删除语言目录 + 语言过滤
+      #
+      # ⚠️ 执行顺序至关重要，请勿与后面的步骤对调：
+      #    本步先把 values-zh-rCN/ 的官方译文合并进 values/strings.xml，
+      #    再套用 OVERRIDE_ZH 覆盖个别文案，最后删除全部 values-* 目录。
+      #    如果把「覆盖文案」放到本步之前，手改的文案会被官方 Weblate
+      #    译文无声覆盖，且不报错 —— 所以两者已合并进同一个脚本。
       # ---------------------------------------------------------------
-      - name: 应用定制改动（中文-only / 检查更新描述）
+      - name: 'STEP-1 中文-only + 文案定制（必须最先执行）'
         run: |
           python3 - <<'PYEOF'
           #!/usr/bin/env python3
           # -*- coding: utf-8 -*-
           """
-          APatch 定制脚本 —— 只做两件事：
+          APatch 定制脚本 —— 一次性完成：
 
-            1. 只保留中文：把 values/strings.xml 翻译成中文，删掉其余所有语言目录
-            2. 「检查更新」的描述改成「自动检测」
+            1. 只保留中文：把 values-zh-rCN 的译文合并进 values/strings.xml，删除其余语言目录
+            2. 覆盖个别界面文案（OVERRIDE_ZH，优先级最高）
+            3. 检查更新描述改为「自动检测」
+            4. build.gradle.kts 加 localeFilters（仅 zh / zh-rCN，剔除繁体与三方库多语言）
 
           特性：
             * 幂等 —— 重复执行不会重复插入、不会报错
             * 基于内容匹配（非行号），上游小改也不容易失效
-            * 任何一步失败都会 exit 1，让 Actions 明确标红
-
-          用法（在仓库根目录执行）：
-              python3 .github/scripts/customize.py
+            * 收尾自检：覆盖项、无繁体目录，任一不符直接 exit 1 让 Actions 标红
           """
 
           import io
@@ -203,6 +208,7 @@ jobs:
           import sys
 
           RES = os.path.join("app", "src", "main", "res")
+          STRINGS = os.path.join(RES, "values", "strings.xml")
 
           # ----------------------------------------------------------------------------
           # 小工具
@@ -230,18 +236,38 @@ jobs:
               print("[customize] ⏭  %s" % msg)
 
 
-          # ----------------------------------------------------------------------------
-          # 1. 只保留中文
-          # ----------------------------------------------------------------------------
-
-          def parse_strings(path):
-              """解析 strings.xml，返回 {name: value}（含 translatable=false 的条目）"""
-              s = read(path)
+          def parse_strings(text):
+              """解析 strings.xml，返回 {name: value}"""
               return {m.group(1): m.group(2) for m in
-                      re.finditer(r'<string[^>]*\bname="([^"]+)"[^>]*>(.*?)</string>', s, re.S)}
+                      re.finditer(r'<string[^>]*\bname="([^"]+)"[^>]*>(.*?)</string>', text, re.S)}
 
 
-          # zh-rCN 里没有翻译的条目，在此补中文（可自行修改）
+          # ----------------------------------------------------------------------------
+          # 文案表
+          # ----------------------------------------------------------------------------
+
+          # 强制覆盖：优先级最高，无论官方译文是否存在都以此为准
+          OVERRIDE_ZH = {
+              # 检查更新
+              "settings_check_update_summary":           "自动检测",
+              # 界面文案定制
+              "settings_sucompat_summary":               "适用于su不生效",
+              "settings_selinux_hide":                   "隐藏 Selinux 改动痕迹",
+              "settings_selinux_hide_summary":           "防止 Selinux 被用户进程检测到修改",
+              "settings_selinux_hide_warning_non_gki":   "可能导致无法开机，请慎重使用！",
+              "enable_web_debugging_summary":            "请在需要时再启用",
+              "settings_night_mode_follow_sys":          "深色模式",
+              "settings_night_mode_follow_sys_summary":  "跟随系统",
+              "settings_use_system_color_theme":         "主题颜色",
+              "settings_use_system_color_theme_summary": "跟随系统",
+          }
+
+          # 万一某条在上游被删掉，插到同名锚点后面（可选，缺失也不致命）
+          INSERT_AFTER = {
+              "enable_web_debugging_summary": "enable_web_debugging",
+          }
+
+          # zh-rCN 里没有翻译的条目，在此补中文（仅在官方译文缺失时生效）
           MANUAL_ZH = {
               "home_dialog_uninstall_message":
                   "仅卸载 AndroidPatch 只会移除管理器应用，并保留已修补的 boot 镜像。"
@@ -255,27 +281,37 @@ jobs:
           # 专有名词，保持原文不做翻译
           KEEP_AS_IS = ("app_name", "about_github", "about_weblate")
 
+          # 非语言的 values- 限定目录（深色模式 / 系统版本 / 屏幕尺寸 / 横竖屏等），不能删
+          NON_LOCALE_DIR = re.compile(
+              r"values-(night|notnight|v\d|sw\d|w\d|h\d|land|port|xlarge|large|normal|small|round|ldrtl|ldltr)")
+
+          # ----------------------------------------------------------------------------
+          # 1. 中文化 + 覆盖文案
+          # ----------------------------------------------------------------------------
 
           def step_chinese_only():
               zh_path = os.path.join(RES, "values-zh-rCN", "strings.xml")
-              en_path = os.path.join(RES, "values", "strings.xml")
 
-              if not os.path.isfile(en_path):
-                  die("找不到 %s" % en_path)
+              if not os.path.isfile(STRINGS):
+                  die("找不到 %s" % STRINGS)
 
-              # ---- 把 values/strings.xml 翻译成中文 ----
-              if os.path.isfile(zh_path):
-                  zh = parse_strings(zh_path)
-                  src = read(en_path)
-                  stats = {"hit": 0, "manual": 0, "keep": 0, "fallback": 0}
+              src = read(STRINGS)
+
+              # ---- 用 zh-rCN 的官方译文翻译 values/strings.xml，并套用覆盖表 ----
+              zh = parse_strings(read(zh_path)) if os.path.isfile(zh_path) else {}
+              if zh:
+                  stats = {"override": 0, "hit": 0, "manual": 0, "keep": 0, "fallback": 0}
                   fallbacks = []
 
                   def repl(m):
                       open_tag, name, value = m.group(1), m.group(2), m.group(3)
+                      if name in OVERRIDE_ZH:          # 最高优先级
+                          stats["override"] += 1
+                          return open_tag + OVERRIDE_ZH[name] + "</string>"
                       if name in KEEP_AS_IS:
                           stats["keep"] += 1
                           return m.group(0)
-                      if name in zh and zh[name].strip():
+                      if zh.get(name, "").strip():
                           stats["hit"] += 1
                           return open_tag + zh[name] + "</string>"
                       if name in MANUAL_ZH:
@@ -285,34 +321,40 @@ jobs:
                       fallbacks.append(name)
                       return m.group(0)
 
-                  out = re.sub(r'(<string[^>]*\bname="([^"]+)"[^>]*>)(.*?)(</string>)',
+                  src = re.sub(r'(<string[^>]*\bname="([^"]+)"[^>]*>)(.*?)(</string>)',
                                repl, src, flags=re.S)
-                  write(en_path, out)
-                  done("values/strings.xml 已中文化（译文 %d 条 / 补译 %d 条 / 保留专有名词 %d 条）"
-                       % (stats["hit"], stats["manual"], stats["keep"]))
+                  write(STRINGS, src)
+                  done("values/strings.xml 已中文化（覆盖 %d 条 / 译文 %d 条 / 补译 %d 条 / 保留专有名词 %d 条）"
+                       % (stats["override"], stats["hit"], stats["manual"], stats["keep"]))
                   if fallbacks:
                       print("[customize] ⚠  以下 %d 条未找到中文，保持英文：%s"
                             % (len(fallbacks), ", ".join(fallbacks)))
               else:
-                  skip("没有 values-zh-rCN，跳过中文化（values/ 保持原样）")
+                  skip("没有 values-zh-rCN，跳过中文化（仅套用覆盖文案）")
 
-              # ---- 检查更新的描述改成「自动检测」 ----
-              src = read(en_path)
-              old = '<string name="settings_check_update_summary">应用启动时自动检测更新</string>'
-              new = '<string name="settings_check_update_summary">自动检测</string>'
-              if new in src:
-                  skip("检查更新描述已是「自动检测」")
-              elif old in src:
-                  write(en_path, src.replace(old, new, 1))
-                  done("检查更新描述 -> 自动检测")
-              else:
-                  # 兼容：直接按 name 替换任意值
-                  pat = re.compile(r'(<string name="settings_check_update_summary">)(.*?)(</string>)', re.S)
+              # ---- 覆盖表里没生效的，尝试插到锚点后面 ----
+              src = read(STRINGS)
+              present = parse_strings(src)
+              for name, value in OVERRIDE_ZH.items():
+                  if name in present:
+                      continue
+                  anchor = INSERT_AFTER.get(name)
+                  if not anchor:
+                      continue
+                  pat = re.compile(r'(<string name="%s">.*?</string>)' % re.escape(anchor), re.S)
                   if pat.search(src):
-                      write(en_path, pat.sub(lambda m: m.group(1) + "自动检测" + m.group(3), src, count=1))
-                      done("检查更新描述 -> 自动检测")
-                  else:
-                      die("找不到 settings_check_update_summary，上游结构可能已变化")
+                      src = pat.sub(lambda m: m.group(1) +
+                                    '\n    <string name="%s">%s</string>' % (name, value),
+                                    src, count=1)
+                      write(STRINGS, src)
+                      done("缺失项已补插：%s" % name)
+
+              # ---- 自检：所有覆盖项必须真的生效 ----
+              final = parse_strings(read(STRINGS))
+              bad = [n for n, v in OVERRIDE_ZH.items() if final.get(n, "").strip() != v]
+              if bad:
+                  die("以下文案未生效，APatch 版本可能已变化，请核对后手动改：" + ", ".join(bad))
+              done("覆盖项自检通过（%d 条）" % len(OVERRIDE_ZH))
 
               # ---- 删掉除 values/ 之外的所有语言目录 ----
               removed = []
@@ -320,12 +362,19 @@ jobs:
                   d = os.path.join(RES, name)
                   if not os.path.isdir(d) or not name.startswith("values-"):
                       continue
-                  # 跳过非语言限定目录（深色模式、系统版本、屏幕尺寸、横竖屏等）
-                  if re.match(r"values-(night|notnight|v\d|sw\d|w\d|h\d|land|port|xlarge|large)", name):
+                  if NON_LOCALE_DIR.match(name):
                       continue
                   shutil.rmtree(d)
                   removed.append(name)
               done("已删除 %d 个语言目录，只保留 values/" % len(removed))
+
+              # ---- 自检：不得残留任何繁体目录 ----
+              left = [n for n in os.listdir(RES)
+                      if n.startswith("values-") and not NON_LOCALE_DIR.match(n)
+                      and re.search(r"(TW|HK|MO|Hant)", n)]
+              if left:
+                  die("仍有繁体资源目录未删除：%s" % ", ".join(left))
+              done("无繁体资源目录残留")
 
               # ---- unqualifiedResLocale ----
               write(os.path.join(RES, "resources.properties"), "unqualifiedResLocale=zh-rCN")
@@ -333,8 +382,10 @@ jobs:
 
 
           # ----------------------------------------------------------------------------
-          # 2. build.gradle.kts 语言过滤
+          # 2. build.gradle.kts 语言过滤（仅 zh / zh-rCN，不含 zh-rTW）
           # ----------------------------------------------------------------------------
+
+          WANT_LOCALES = 'localeFilters.addAll(listOf("zh", "zh-rCN"))'
 
           def step_locale_filter():
               p = os.path.join("app", "build.gradle.kts")
@@ -342,29 +393,45 @@ jobs:
                   skip("没有 app/build.gradle.kts，跳过语言过滤")
                   return
               s = read(p)
-              if "localeFilters" in s:
-                  skip("build.gradle.kts 已有 localeFilters")
-                  return
 
-              # 匹配 androidResources { ... } 块，往里加一行
+              # ---- 先擦掉已有的 localeFilters（可能是上次写的或上游自带的），保证可更新 ----
+              out, skipping = [], False
+              for line in s.splitlines(True):
+                  if skipping:
+                      if line.rstrip().endswith((")", "}", "]")):
+                          skipping = False
+                      continue
+                  if re.match(r'^[ \t]*localeFilters\b', line):
+                      if not line.rstrip().endswith((")", "}", "]")):
+                          skipping = True
+                      continue
+                  out.append(line)
+              s = "".join(out)
+
+              # ---- 写进 androidResources 块（没有就新建）----
               pat = re.compile(r"(androidResources \{\n(?:[ \t]*.*\n)*?)([ \t]*)\}")
               m = pat.search(s)
-              if not m:
-                  die("build.gradle.kts 里找不到 androidResources 块")
-              closers = m.group(2) if m.group(2) else "    "
-              indent = closers + "    "  # 块内语句比闭合括号多一级缩进
-              s = s[:m.start()] + m.group(1) + \
-                  '%slocaleFilters.addAll(listOf("zh", "zh-rCN", "zh-rTW"))\n%s}' % (indent, closers) + \
-                  s[m.end():]
+              if m:
+                  closers = m.group(2) if m.group(2) else "    "
+                  indent = closers + "    "   # 块内语句比闭合括号多一级缩进
+                  s = s[:m.start()] + m.group(1) + \
+                      "%s%s\n%s}" % (indent, WANT_LOCALES, closers) + s[m.end():]
+              else:
+                  m2 = re.search(r'^android \{\n', s, re.M)
+                  if not m2:
+                      die("build.gradle.kts 里既找不到 androidResources 块，也找不到 android 块")
+                  s = s[:m2.end()] + \
+                      "    androidResources {\n        %s\n    }\n" % WANT_LOCALES + s[m2.end():]
+
               write(p, s)
-              done("build.gradle.kts 已加 localeFilters（剔除三方库的多语言资源）")
+              done("build.gradle.kts -> %s（剔除繁体与三方库多语言）" % WANT_LOCALES)
 
 
           # ----------------------------------------------------------------------------
 
           def main():
               print("=" * 68)
-              print(" APatch 定制：中文-only + 检查更新描述改为自动检测")
+              print(" APatch 定制：中文-only + 文案覆盖 + 语言过滤")
               print("=" * 68)
               step_chinese_only()
               step_locale_filter()
@@ -378,9 +445,9 @@ jobs:
           PYEOF
 
       # ---------------------------------------------------------------
-      # 3.（可选）改包名
+      # STEP-2（可选）改包名
       # ---------------------------------------------------------------
-      - name: 修改管理器包名
+      - name: 'STEP-2 修改管理器包名'
         if: ${{ inputs.package_name != '' }}
         env:
           NEW_PACKAGE: ${{ inputs.package_name }}
@@ -417,79 +484,14 @@ jobs:
           grep -n "namespace" app/build.gradle.kts
 
       # ---------------------------------------------------------------
-      # 3.5 改界面中文文案
-      #     注意：上一步已删掉 values-zh-rCN/，这里改的是中文版 values/strings.xml
-      # ---------------------------------------------------------------
-      - name: 修改界面中文文案
-        run: |
-          set -euo pipefail
-          python3 - <<'PY'
-          import io, re, sys
-
-          path = "app/src/main/res/values/strings.xml"
-          src = io.open(path, encoding="utf-8").read()
-
-          # (字符串名, 新的文案)
-          edits = [
-              ("settings_sucompat_summary",              "适用于su不生效"),
-              ("settings_selinux_hide",                  "隐藏 Selinux 改动痕迹"),
-              ("settings_selinux_hide_summary",          "防止 Selinux 被用户进程检测到修改"),
-              ("settings_selinux_hide_warning_non_gki",  "可能导致无法开机，请慎重使用！"),
-              ("enable_web_debugging_summary",           "请在需要时再启用"),
-              ("settings_night_mode_follow_sys",         "深色模式"),
-              ("settings_night_mode_follow_sys_summary", "跟随系统"),
-              ("settings_use_system_color_theme",        "主题颜色"),
-              ("settings_use_system_color_theme_summary","跟随系统"),
-          ]
-
-          # 保险：万一某条目缺失（会回退显示英文），插到同名锚点后面
-          insert_after = {
-              "enable_web_debugging_summary": "enable_web_debugging",
-          }
-
-          def set_string(text, name, value):
-              pat = re.compile(r'(<string name="%s">)(.*?)(</string>)' % re.escape(name), re.S)
-              if pat.search(text):
-                  return pat.sub(lambda m: m.group(1) + value + m.group(3), text, count=1), True
-              return text, False
-
-          missing = []
-          for name, value in edits:
-              src, ok = set_string(src, name, value)
-              if not ok:
-                  missing.append(name)
-
-          for name in list(missing):
-              anchor = insert_after.get(name)
-              if not anchor:
-                  continue
-              value = dict(edits)[name]
-              pat = re.compile(r'(<string name="%s">.*?</string>)' % re.escape(anchor), re.S)
-              if pat.search(src):
-                  src = pat.sub(
-                      lambda m: m.group(1) + '\n    <string name="%s">%s</string>' % (name, value),
-                      src, count=1)
-                  missing.remove(name)
-
-          if missing:
-              sys.exit("以下字符串没找到，APatch 版本可能已变化，请核对后手动改："
-                       + ", ".join(missing))
-
-          io.open(path, "w", encoding="utf-8").write(src)
-          print("界面文案修改完成：")
-          for name, value in edits:
-              print("  %-42s -> %s" % (name, value))
-          PY
-
-      # ---------------------------------------------------------------
-      # 3.7 精简语言列表：保留「跟随系统」入口，只留「中文」
+      # STEP-3 精简语言列表：保留「跟随系统」入口，只留「中文」
       #     注意：Settings.kt 的 LanguageDialog 把 index == 0 硬编码为「跟随系统」
       #     （走 LocaleListCompat.getEmptyLocaleList()），所以第 0 项不能删，
       #     否则「中文」会变成 index 0，点了反而切回跟随系统，永远选不中。
       #     纯改资源文件、不碰 Kotlin，零编译风险
       #     幂等：重复执行会安全跳过
       # ---------------------------------------------------------------
-      - name: 精简语言列表
+      - name: 'STEP-3 精简语言列表'
         run: |
           set -euo pipefail
           python3 - <<'PY'
@@ -554,9 +556,9 @@ jobs:
           PY
 
       # ---------------------------------------------------------------
-      # 4. 编译管理器 APK
+      # STEP-4 编译管理器 APK
       # ---------------------------------------------------------------
-      - name: 编译管理器 APK
+      - name: 'STEP-4 编译管理器 APK'
         run: |
           echo 'org.gradle.parallel=true'          >> gradle.properties
           echo 'org.gradle.jvmargs=-Xmx4096m'      >> gradle.properties
@@ -583,9 +585,9 @@ jobs:
           ls -l "$SIGNED"
 
       # ---------------------------------------------------------------
-      # 5. 一致性校验：APK 证书摘要必须等于写进内核的那个
+      # STEP-5 一致性校验：APK 证书摘要必须等于写进内核的那个
       # ---------------------------------------------------------------
-      - name: 校验证书摘要与 kpimg 一致
+      - name: 'STEP-5 校验证书摘要与 kpimg 一致'
         env:
           SIGNED: ${{ steps.sign.outputs.signed }}
           BUILD_TOOL_VERSION: ${{ env.BUILD_TOOL_VERSION }}
@@ -602,6 +604,48 @@ jobs:
             exit 1
           fi
           echo "✅ 摘要一致"
+
+      # ---------------------------------------------------------------
+      # STEP-6 校验成品 APK：无繁体资源 + 中文文案生效
+      # ---------------------------------------------------------------
+      - name: 'STEP-6 校验成品 APK（无繁体 / 文案生效）'
+        env:
+          SIGNED: ${{ steps.sign.outputs.signed }}
+          BUILD_TOOL_VERSION: ${{ env.BUILD_TOOL_VERSION }}
+        run: |
+          set -euo pipefail
+          AAPT2="$ANDROID_HOME/build-tools/$BUILD_TOOL_VERSION/aapt2"
+
+          echo "--- 6.1 APK 内 locale 列表 ---"
+          LOCALES=$("$AAPT2" dump badging "$SIGNED" | sed -n 's/^locales: //p' || true)
+          echo "locales: ${LOCALES:-<未输出>}"
+          if echo "$LOCALES" | grep -qiE 'TW|HK|MO|Hant'; then
+            echo "::error::仍存在繁体资源：$LOCALES"
+            exit 1
+          fi
+          echo "✅ 无繁体资源"
+
+          echo "--- 6.2 中文文案自检（源码侧）---"
+          python3 - <<'PY'
+          import io, re, sys
+          src = io.open("app/src/main/res/values/strings.xml", encoding="utf-8").read()
+          want = {
+              "settings_check_update_summary":          "自动检测",
+              "settings_sucompat_summary":              "适用于su不生效",
+              "settings_night_mode_follow_sys":         "深色模式",
+              "settings_use_system_color_theme":        "主题颜色",
+          }
+          bad = []
+          for name, val in want.items():
+              m = re.search(r'<string name="%s">(.*?)</string>' % name, src, re.S)
+              got = m.group(1).strip() if m else None
+              if got != val:
+                  bad.append("%s -> %r（期望 %r）" % (name, got, val))
+          if bad:
+              print("\n".join(bad))
+              sys.exit("::error::文案校验未通过")
+          print("✅ 文案校验通过（%d 条）" % len(want))
+          PY
 
       - name: 上传编译产物
         uses: actions/upload-artifact@v7
