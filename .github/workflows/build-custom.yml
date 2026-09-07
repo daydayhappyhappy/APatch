@@ -4,8 +4,9 @@ name: 编译自定义 APatch
 #   1. 用你自己的 keystore 算出签名证书的 SHA-256
 #   2. 把「包名 + 证书摘要」写进 KernelPatch，编译出定制版 kpimg
 #   3. （可选）把管理器包名改成任意名字
-#   4. 编译管理器 APK，并用 v2-only 方案重签名
-#   5. 校验 APK 证书摘要与 kpimg 内写死的一致，产出可直接刷机的 APK
+#   4. 只保留中文语言，检查更新描述改为「自动检测」
+#   5. 编译管理器 APK，并用 v2-only 方案重签名
+#   6. 校验 APK 证书摘要与 kpimg 内写死的一致，产出可直接刷机的 APK
 #
 # 触发方式：Actions 页 -> 本工作流 -> Run workflow
 
@@ -90,7 +91,7 @@ jobs:
             -keypass "$KEY_PASSWORD" \
             -file "$RUNNER_TEMP/cert.der"
 
-          DIGEST=$(sha256sum "$RUNNER_TEMP/cert.der" | cut -d' ' -f1)
+          DIGEST=$(sha256sum "$RUNNER_TEMP/cert.der" | cut -d ' ' -f1)
           echo "签名证书 SHA-256: $DIGEST"
           echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
           echo "CERT_DIGEST=$DIGEST" >> "$GITHUB_ENV"
@@ -172,6 +173,210 @@ jobs:
           ls -l "$GITHUB_WORKSPACE/app/src/main/assets/kpimg"
 
       # ---------------------------------------------------------------
+      # 3.6 只保留中文 + 检查更新描述改为「自动检测」（内联脚本，无需额外文件）
+      # ---------------------------------------------------------------
+      - name: 应用定制改动（中文-only / 检查更新描述）
+        run: |
+          python3 - <<'PYEOF'
+          #!/usr/bin/env python3
+          # -*- coding: utf-8 -*-
+          """
+          APatch 定制脚本 —— 只做两件事：
+
+            1. 只保留中文：把 values/strings.xml 翻译成中文，删掉其余所有语言目录
+            2. 「检查更新」的描述改成「自动检测」
+
+          特性：
+            * 幂等 —— 重复执行不会重复插入、不会报错
+            * 基于内容匹配（非行号），上游小改也不容易失效
+            * 任何一步失败都会 exit 1，让 Actions 明确标红
+
+          用法（在仓库根目录执行）：
+              python3 .github/scripts/customize.py
+          """
+
+          import io
+          import os
+          import re
+          import shutil
+          import sys
+
+          RES = os.path.join("app", "src", "main", "res")
+
+          # ----------------------------------------------------------------------------
+          # 小工具
+          # ----------------------------------------------------------------------------
+
+          def read(path):
+              with io.open(path, encoding="utf-8") as f:
+                  return f.read()
+
+
+          def write(path, text):
+              with io.open(path, "w", encoding="utf-8", newline="\n") as f:
+                  f.write(text)
+
+
+          def die(msg):
+              sys.exit("\n[customize] 失败：%s\n" % msg)
+
+
+          def done(msg):
+              print("[customize] ✅ %s" % msg)
+
+
+          def skip(msg):
+              print("[customize] ⏭  %s" % msg)
+
+
+          # ----------------------------------------------------------------------------
+          # 1. 只保留中文
+          # ----------------------------------------------------------------------------
+
+          def parse_strings(path):
+              """解析 strings.xml，返回 {name: value}（含 translatable=false 的条目）"""
+              s = read(path)
+              return {m.group(1): m.group(2) for m in
+                      re.finditer(r'<string[^>]*\bname="([^"]+)"[^>]*>(.*?)</string>', s, re.S)}
+
+
+          # zh-rCN 里没有翻译的条目，在此补中文（可自行修改）
+          MANUAL_ZH = {
+              "home_dialog_uninstall_message":
+                  "仅卸载 AndroidPatch 只会移除管理器应用，并保留已修补的 boot 镜像。"
+                  "卸载全部还会还原官方原版 boot 镜像，设备将失去 root，直到重新修补。",
+              "reboot_download_confirm":
+                  "重启进入 Download 模式？设备将进入固件刷机界面。",
+              "reboot_edl_confirm":
+                  "重启进入 EDL（紧急下载）模式？屏幕会保持黑屏，只能通过深度刷机工具恢复。",
+          }
+
+          # 专有名词，保持原文不做翻译
+          KEEP_AS_IS = ("app_name", "about_github", "about_weblate")
+
+
+          def step_chinese_only():
+              zh_path = os.path.join(RES, "values-zh-rCN", "strings.xml")
+              en_path = os.path.join(RES, "values", "strings.xml")
+
+              if not os.path.isfile(en_path):
+                  die("找不到 %s" % en_path)
+
+              # ---- 把 values/strings.xml 翻译成中文 ----
+              if os.path.isfile(zh_path):
+                  zh = parse_strings(zh_path)
+                  src = read(en_path)
+                  stats = {"hit": 0, "manual": 0, "keep": 0, "fallback": 0}
+                  fallbacks = []
+
+                  def repl(m):
+                      open_tag, name, value = m.group(1), m.group(2), m.group(3)
+                      if name in KEEP_AS_IS:
+                          stats["keep"] += 1
+                          return m.group(0)
+                      if name in zh and zh[name].strip():
+                          stats["hit"] += 1
+                          return open_tag + zh[name] + "</string>"
+                      if name in MANUAL_ZH:
+                          stats["manual"] += 1
+                          return open_tag + MANUAL_ZH[name] + "</string>"
+                      stats["fallback"] += 1
+                      fallbacks.append(name)
+                      return m.group(0)
+
+                  out = re.sub(r'(<string[^>]*\bname="([^"]+)"[^>]*>)(.*?)(</string>)',
+                               repl, src, flags=re.S)
+                  write(en_path, out)
+                  done("values/strings.xml 已中文化（译文 %d 条 / 补译 %d 条 / 保留专有名词 %d 条）"
+                       % (stats["hit"], stats["manual"], stats["keep"]))
+                  if fallbacks:
+                      print("[customize] ⚠  以下 %d 条未找到中文，保持英文：%s"
+                            % (len(fallbacks), ", ".join(fallbacks)))
+              else:
+                  skip("没有 values-zh-rCN，跳过中文化（values/ 保持原样）")
+
+              # ---- 检查更新的描述改成「自动检测」 ----
+              src = read(en_path)
+              old = '<string name="settings_check_update_summary">应用启动时自动检测更新</string>'
+              new = '<string name="settings_check_update_summary">自动检测</string>'
+              if new in src:
+                  skip("检查更新描述已是「自动检测」")
+              elif old in src:
+                  write(en_path, src.replace(old, new, 1))
+                  done("检查更新描述 -> 自动检测")
+              else:
+                  # 兼容：直接按 name 替换任意值
+                  pat = re.compile(r'(<string name="settings_check_update_summary">)(.*?)(</string>)', re.S)
+                  if pat.search(src):
+                      write(en_path, pat.sub(lambda m: m.group(1) + "自动检测" + m.group(3), src, count=1))
+                      done("检查更新描述 -> 自动检测")
+                  else:
+                      die("找不到 settings_check_update_summary，上游结构可能已变化")
+
+              # ---- 删掉除 values/ 之外的所有语言目录 ----
+              removed = []
+              for name in sorted(os.listdir(RES)):
+                  d = os.path.join(RES, name)
+                  if not os.path.isdir(d) or not name.startswith("values-"):
+                      continue
+                  # 跳过非语言限定目录（深色模式、系统版本、屏幕尺寸、横竖屏等）
+                  if re.match(r"values-(night|notnight|v\d|sw\d|w\d|h\d|land|port|xlarge|large)", name):
+                      continue
+                  shutil.rmtree(d)
+                  removed.append(name)
+              done("已删除 %d 个语言目录，只保留 values/" % len(removed))
+
+              # ---- unqualifiedResLocale ----
+              write(os.path.join(RES, "resources.properties"), "unqualifiedResLocale=zh-rCN")
+              done("resources.properties -> unqualifiedResLocale=zh-rCN")
+
+
+          # ----------------------------------------------------------------------------
+          # 2. build.gradle.kts 语言过滤
+          # ----------------------------------------------------------------------------
+
+          def step_locale_filter():
+              p = os.path.join("app", "build.gradle.kts")
+              if not os.path.isfile(p):
+                  skip("没有 app/build.gradle.kts，跳过语言过滤")
+                  return
+              s = read(p)
+              if "localeFilters" in s:
+                  skip("build.gradle.kts 已有 localeFilters")
+                  return
+
+              # 匹配 androidResources { ... } 块，往里加一行
+              pat = re.compile(r"(androidResources \{\n(?:[ \t]*.*\n)*?)([ \t]*)\}")
+              m = pat.search(s)
+              if not m:
+                  die("build.gradle.kts 里找不到 androidResources 块")
+              closers = m.group(2) if m.group(2) else "    "
+              indent = closers + "    "  # 块内语句比闭合括号多一级缩进
+              s = s[:m.start()] + m.group(1) + \
+                  '%slocaleFilters.addAll("zh", "zh-rCN", "zh-rTW")\n%s}' % (indent, closers) + \
+                  s[m.end():]
+              write(p, s)
+              done("build.gradle.kts 已加 localeFilters（剔除三方库的多语言资源）")
+
+
+          # ----------------------------------------------------------------------------
+
+          def main():
+              print("=" * 68)
+              print(" APatch 定制：中文-only + 检查更新描述改为自动检测")
+              print("=" * 68)
+              step_chinese_only()
+              step_locale_filter()
+              print("=" * 68)
+              print(" 全部完成 ✅")
+              print("=" * 68)
+
+
+          if __name__ == "__main__":
+              main()
+          PYEOF
+
+      # ---------------------------------------------------------------
       # 3.（可选）改包名
       # ---------------------------------------------------------------
       - name: 修改管理器包名
@@ -211,8 +416,8 @@ jobs:
           grep -n "namespace" app/build.gradle.kts
 
       # ---------------------------------------------------------------
-      # 3.5 改界面中文文案（在「修改管理器包名」之前或之后均可）
-      #     直接改 app/src/main/res/values-zh-rCN/strings.xml
+      # 3.5 改界面中文文案
+      #     注意：上一步已删掉 values-zh-rCN/，这里改的是中文版 values/strings.xml
       # ---------------------------------------------------------------
       - name: 修改界面中文文案
         run: |
@@ -220,7 +425,7 @@ jobs:
           python3 - <<'PY'
           import io, re, sys
 
-          path = "app/src/main/res/values-zh-rCN/strings.xml"
+          path = "app/src/main/res/values/strings.xml"
           src = io.open(path, encoding="utf-8").read()
 
           # (字符串名, 新的文案)
@@ -235,7 +440,7 @@ jobs:
               ("settings_use_system_color_theme_summary","跟随系统"),
           ]
 
-          # 保险：万一某条目在中文包里缺失（会回退显示英文），插到同名锚点后面
+          # 保险：万一某条目缺失（会回退显示英文），插到同名锚点后面
           insert_after = {
               "enable_web_debugging_summary": "enable_web_debugging",
           }
