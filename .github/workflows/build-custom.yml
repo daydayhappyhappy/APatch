@@ -252,7 +252,7 @@ jobs:
               "settings_check_update_summary":           "自动检测",
               # 界面文案定制
               "settings_sucompat_summary":               "适用于su不生效",
-              "settings_selinux_hide":                   "隐藏 Selinux 的修改痕迹",
+              "settings_selinux_hide":                   "隐藏 Selinux 修改痕迹",
               "settings_selinux_hide_summary":           "可有效通过用户进程对Selinux的检测",
               "settings_selinux_hide_warning_non_gki":   "可能导致无法开机，请慎重使用。",
               "enable_web_debugging_summary":            "请在需要时再启用",
