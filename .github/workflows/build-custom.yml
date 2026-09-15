@@ -660,5 +660,3 @@ jobs:
           tag_name: custom-${{ github.run_number }}
           name: 自定义 APatch 构建 #${{ github.run_number }}
           files: ${{ steps.sign.outputs.signed }}
-
-
