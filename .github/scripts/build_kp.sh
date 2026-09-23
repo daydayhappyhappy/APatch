@@ -22,6 +22,7 @@ TC_DIR="${TC_DIR:-$(pwd)/arm-toolchain}"
 DO_KO=0
 KDIR=""
 KMI=""
+SELF_PKG=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -30,6 +31,7 @@ while [[ $# -gt 0 ]]; do
     --ko)     DO_KO=1;       shift;;
     --kdir)   KDIR="$2";     shift 2;;
     --kmi)    KMI="$2";      shift 2;;
+    --package) SELF_PKG="$2"; shift 2;;
     *) echo "未知参数: $1" >&2; exit 1;;
   esac
 done
@@ -55,9 +57,14 @@ if [[ -z "$TARGET_COMPILE" ]]; then
   else
     echo "[0/3] 下载 ARM 官方工具链 ${TC_VER}..."
     mkdir -p "$TC_DIR"
-    curl -sSL --retry 3 -o "$TC_DIR/$TC_TAR" "$TC_URL"
-    tar -Jxf "$TC_DIR/$TC_TAR" -C "$TC_DIR"
-    TARGET_COMPILE="$TC_DIR/arm-gnu-toolchain-${TC_VER}-x86_64-aarch64-none-elf/bin/aarch64-none-elf-"
+    if curl -fsSL --retry 3 -o "$TC_DIR/$TC_TAR" "$TC_URL" && \
+       tar -Jxf "$TC_DIR/$TC_TAR" -C "$TC_DIR"; then
+      TARGET_COMPILE="$TC_DIR/arm-gnu-toolchain-${TC_VER}-x86_64-aarch64-none-elf/bin/aarch64-none-elf-"
+    else
+      echo "  ⚠ ARM 官方源下载失败，回退 apt 的 aarch64-linux-gnu"
+      apt-get update -qq && apt-get install -y -qq gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu
+      TARGET_COMPILE="aarch64-linux-gnu-"
+    fi
   fi
 fi
 [[ -x "${TARGET_COMPILE}gcc" ]] || { echo "找不到交叉编译器: ${TARGET_COMPILE}gcc" >&2; exit 1; }
@@ -71,12 +78,19 @@ cp -f "$KP_DIR/kernel/kpimg" "$OUT_DIR/kpimg"
 ls -la "$OUT_DIR/kpimg"
 
 # ---------- 2. 自检：包名确实编进去了 ----------
-echo "[2/3] 自检 kpimg 里是否含新包名..."
+echo "[2/3] 自检 kpimg..."
 if grep -qa "com.example.apatch" "$OUT_DIR/kpimg"; then
-  echo "  ⚠ kpimg 里还是 com.example.apatch —— 说明 patch_kp_trusted_manager.py 没跑成功"
-else
-  echo "  ✔ 占位包名已被替换"
+  echo "  ⚠ kpimg 里还是 com.example.apatch —— patch_kp_trusted_manager.py 没跑成功"
 fi
+if [[ -n "$SELF_PKG" ]]; then
+  if grep -qa "$SELF_PKG" "$OUT_DIR/kpimg"; then
+    echo "  ✔ kpimg 里已含新包名 $SELF_PKG"
+  else
+    echo "  ✘ kpimg 里找不到 $SELF_PKG —— 内核不会认这个管理器"
+    exit 1
+  fi
+fi
+echo "  ✔ kpimg 大小: $(stat -c%s "$OUT_DIR/kpimg") 字节"
 
 # ---------- 3. .ko（可选）----------
 if [[ "$DO_KO" -eq 1 ]]; then

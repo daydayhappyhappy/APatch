@@ -47,7 +47,10 @@ jobs:
           echo "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin" >> $GITHUB_PATH
           echo "$ANDROID_SDK_ROOT/platform-tools" >> $GITHUB_PATH
           yes | $ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager --licenses > /dev/null 2>&1 || true
-          echo "BUILD_TOOLS_VERSION=$(ls $ANDROID_SDK_ROOT/build-tools/ | tail -n 1)" >> $GITHUB_ENV
+          BT=$(ls $ANDROID_SDK_ROOT/build-tools/ | tail -n 1)
+          echo "BUILD_TOOLS_VERSION=$BT" >> $GITHUB_ENV
+          # apksigner / zipalign 不在默认 PATH，自检步骤要用
+          echo "$ANDROID_SDK_ROOT/build-tools/$BT" >> $GITHUB_PATH
 
       - name: Setup Rust and cargo-ndk
         run: |
@@ -104,7 +107,7 @@ jobs:
       # 只编 kpimg：trusted_managers[] 只进 kpimg，
       # kptools / kpatch 里没有包名，继续用官方同版本产物
       - name: Build kpimg
-        run: bash .github/scripts/build_kp.sh --kp-dir KernelPatch --out kp-out
+        run: bash .github/scripts/build_kp.sh --kp-dir KernelPatch --out kp-out --package "$NEW_PKG"
 
       - name: Install kpimg into APatch
         run: bash .github/scripts/install_kp_into_apatch.sh . kp-out
@@ -132,8 +135,12 @@ jobs:
 
       - name: Self-check signature
         run: |
-          echo "--- 签名方案（必须 v1=false v2=true v3=false）---"
-          apksigner verify --verbose "$SIGNED_APK" | grep -E "v1 scheme|v2 scheme|v3 scheme"
+          V=$(apksigner verify --verbose "$SIGNED_APK")
+          echo "$V" | grep -E "v1 scheme|v2 scheme|v3 scheme"
+          echo "$V" | grep -q "Verified using v1 scheme.*: false" || { echo "✘ 带了 v1"; exit 1; }
+          echo "$V" | grep -q "Verified using v2 scheme.*: true"  || { echo "✘ v2 无效"; exit 1; }
+          echo "$V" | grep -q "Verified using v3 scheme.*: true"  && { echo "✘ 带了 v3"; exit 1; }
+          echo "✔ 纯 v2 签名"
           echo "--- 证书摘要（应与内核里烧的一致）---"
           apksigner verify --print-certs "$SIGNED_APK" | grep "SHA-256"
           echo "--- v1 残留检查（不得有 META-INF/*.RSA|DSA|EC）---"
