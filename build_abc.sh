@@ -1,6 +1,9 @@
 #!/bin/bash
 # APatch 改包名脚本（修正版）
-# 用法: NEW_PKG=com.abc.manager NEW_NAME=ABC bash build_abc_fixed.sh
+# 用法: NEW_PKG=com.abc.manager NEW_NAME=ABC bash build_abc.sh
+#
+# ⚠ 包名不要带保留前缀：com.android.* / com.google.* / android.* / com.example.*
+#   默认值已经是 com.abc.manager，一般直接用默认即可
 set -e
 
 OLD_PKG="me.bmax.apatch"
