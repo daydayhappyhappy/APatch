@@ -1,0 +1,182 @@
+name: Build ABC APK (云编译密钥版 · 首次跑自动生成并固定)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    # 注意：secrets 上下文只能在 job 级 env 用，不能写在 workflow 级
+    env:
+      # ⚠️ 不要用 com.android.* / com.google.* / android.* / com.example.* —— 保留前缀
+      NEW_PKG: com.abc.manager
+      NEW_NAME: ABC
+      KP_VERSION: 0.13.8        # 必须和 app/src/main/cpp/version 里的版本一致
+      HAS_KEY: ${{ secrets.SIGNING_KEY != '' }}
+      KEY_STORE_PASSWORD: ${{ secrets.KEY_STORE_PASSWORD }}
+      KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+      KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+
+    steps:
+      - name: Checkout APatch
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0        # 版本号 = epoch + git rev-list --count HEAD，浅克隆会算错
+
+      - name: Checkout KernelPatch (版本必须对齐)
+        uses: actions/checkout@v4
+        with:
+          repository: bmax121/KernelPatch
+          ref: ${{ env.KP_VERSION }}
+          path: KernelPatch
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'jetbrains'
+          java-version: '21'
+
+      - name: Setup Android SDK
+        run: |
+          echo "ANDROID_HOME=$ANDROID_SDK_ROOT" >> $GITHUB_ENV
+          echo "ANDROID_NDK_HOME=$ANDROID_SDK_ROOT/ndk" >> $GITHUB_ENV
+          echo "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin" >> $GITHUB_PATH
+          echo "$ANDROID_SDK_ROOT/platform-tools" >> $GITHUB_PATH
+          yes | $ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager --licenses > /dev/null 2>&1 || true
+          echo "BUILD_TOOLS_VERSION=$(ls $ANDROID_SDK_ROOT/build-tools/ | tail -n 1)" >> $GITHUB_ENV
+
+      - name: Setup Rust and cargo-ndk
+        run: |
+          rustup default stable
+          rustup target add aarch64-linux-android
+          cargo install cargo-ndk
+          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+
+      # ============================================================
+      # 密钥：已存 Secret 就复用；没存就本次生成并回传
+      # 摘要和内核必须来自「同一把钥匙」，所以必须在编译 KernelPatch 之前
+      # ============================================================
+      - name: Restore keystore from Secret
+        if: env.HAS_KEY == 'true'
+        env:
+          SIGNING_KEY: ${{ secrets.SIGNING_KEY }}
+        run: |
+          echo "$SIGNING_KEY" | base64 -d > "$RUNNER_TEMP/abc.jks"
+          echo "KEYSTORE_FILE=$RUNNER_TEMP/abc.jks" >> $GITHUB_ENV
+          echo "✔ 复用 Secret 里的固定密钥"
+
+      - name: Generate keystore (仅首次)
+        if: env.HAS_KEY != 'true'
+        run: |
+          KS="$RUNNER_TEMP/abc.jks"
+          PASS="$(head -c 18 /dev/urandom | base64 | tr -d '/+=' | head -c 16)"
+          keytool -genkeypair -v -keystore "$KS" -storetype PKCS12 \
+            -alias abc -keyalg RSA -keysize 2048 -validity 10950 \
+            -storepass "$PASS" -keypass "$PASS" \
+            -dname "CN=${NEW_NAME}, OU=${NEW_NAME}, O=${NEW_NAME}, L=${NEW_NAME}, ST=${NEW_NAME}, C=CN"
+          echo "KEYSTORE_FILE=$KS" >> $GITHUB_ENV
+          echo "KEY_STORE_PASSWORD=$PASS" >> $GITHUB_ENV
+          echo "KEY_ALIAS=abc" >> $GITHUB_ENV
+          echo "KEY_PASSWORD=$PASS" >> $GITHUB_ENV
+          echo "KEY_IS_NEW=1" >> $GITHUB_ENV
+
+      # ============================================================
+      # 把包名 + 证书摘要烧进内核两张表
+      #   kernel/patch/android/userd.c  -> trusted_managers[]     (kpimg / 刷 boot)
+      #   lkm/manager/apk_sign.c        -> kp_trusted_managers[]  (.ko / 免刷机)
+      # ============================================================
+      - name: Write trusted manager into KernelPatch
+        run: |
+          python3 .github/scripts/patch_kp_trusted_manager.py \
+            --kp-dir KernelPatch \
+            --package "$NEW_PKG" \
+            --keystore "$KEYSTORE_FILE" \
+            --alias "$KEY_ALIAS" \
+            --storepass "$KEY_STORE_PASSWORD"
+          echo "--- 核对 ---"
+          grep -A3 "$NEW_PKG" KernelPatch/kernel/patch/android/userd.c
+          grep -A3 "$NEW_PKG" KernelPatch/lkm/manager/apk_sign.c
+
+      # 只编 kpimg：trusted_managers[] 只进 kpimg，
+      # kptools / kpatch 里没有包名，继续用官方同版本产物
+      - name: Build kpimg
+        run: bash .github/scripts/build_kp.sh --kp-dir KernelPatch --out kp-out
+
+      - name: Install kpimg into APatch
+        run: bash .github/scripts/install_kp_into_apatch.sh . kp-out
+
+      # ============================================================
+      # 改包名 + 构建 + v2-only 签名
+      # 内核要求：只有 v2（有 v1 拒、有 v3/v3.1 拒），
+      # 所以不能用 -Pandroid.injected.signing.*，统一走 sign_v2_only.sh
+      # ============================================================
+      - name: Rename package and app name
+        run: |
+          chmod +x build_abc.sh
+          NEW_PKG="$NEW_PKG" NEW_NAME="$NEW_NAME" bash build_abc.sh
+
+      - name: Grant execute permission
+        run: chmod +x gradlew
+
+      - name: Build Release APK
+        run: ./gradlew app:assembleRelease
+
+      - name: Sign Release (v2 only)
+        run: |
+          SIGNED=$(bash .github/scripts/sign_v2_only.sh app/build/outputs/apk/release | tail -n 1)
+          echo "SIGNED_APK=$SIGNED" >> $GITHUB_ENV
+
+      - name: Self-check signature
+        run: |
+          echo "--- 签名方案（必须 v1=false v2=true v3=false）---"
+          apksigner verify --verbose "$SIGNED_APK" | grep -E "v1 scheme|v2 scheme|v3 scheme"
+          echo "--- 证书摘要（应与内核里烧的一致）---"
+          apksigner verify --print-certs "$SIGNED_APK" | grep "SHA-256"
+          echo "--- v1 残留检查（不得有 META-INF/*.RSA|DSA|EC）---"
+          if unzip -l "$SIGNED_APK" | grep -E "META-INF/.*\.(RSA|DSA|EC)"; then
+            echo "✘ 有 v1 残留"; exit 1
+          else
+            echo "✔ 无 v1 残留"
+          fi
+
+      # ============================================================
+      # 产物 + 首次回传密钥
+      # ============================================================
+      - name: Upload APK + kpimg
+        uses: actions/upload-artifact@v4
+        with:
+          name: ABC-release
+          path: |
+            ${{ env.SIGNED_APK }}
+            kp-out/kpimg
+          if-no-files-found: error
+
+      - name: ⚠ 首次：把这 4 个存进 Settings → Secrets → Actions
+        if: env.KEY_IS_NEW == '1'
+        run: |
+          cp "$KEYSTORE_FILE" abc.jks
+          {
+            echo "## 🔑 保存这 4 个到 Secrets，下次构建自动复用"
+            echo
+            echo "密钥同时上传为 artifact \`abc-keystore\`（保留 90 天）。"
+            echo '```'
+            echo "SIGNING_KEY        = $(base64 -w0 abc.jks)"
+            echo "KEY_STORE_PASSWORD = $KEY_STORE_PASSWORD"
+            echo "KEY_ALIAS          = $KEY_ALIAS"
+            echo "KEY_PASSWORD       = $KEY_PASSWORD"
+            echo '```'
+            echo
+            echo "> ⚠ base64 是私钥，日志对仓库协作者可见。存好 Secret 后建议删除本次运行记录。"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload keystore (仅首次)
+        if: env.KEY_IS_NEW == '1'
+        uses: actions/upload-artifact@v4
+        with:
+          name: abc-keystore
+          path: abc.jks
+          if-no-files-found: error
