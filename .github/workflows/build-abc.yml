@@ -122,6 +122,12 @@ jobs:
           chmod +x build_abc.sh
           NEW_PKG="$NEW_PKG" NEW_NAME="$NEW_NAME" bash build_abc.sh
 
+      # 必须在改包名之后跑：脚本要找的是新包名目录下的源码文件
+      - name: Customize UI
+        run: |
+          chmod +x ui_customize.sh
+          bash ui_customize.sh
+
       - name: Grant execute permission
         run: chmod +x gradlew
 
