@@ -41,32 +41,65 @@ FAILS = []
 SKIP = "SKIP"   # 已定制过，属正常跳过，不算失败
 
 
-def edit(rel, fn, label, required=True):
-    """fn 返回值：文本=已改写；SKIP=已定制过不用再动；None=锚点没对上，算失败"""
+def edit(rel, fn, label, required=True, group=False):
+    """fn 返回值：文本=已改写；SKIP=已定制过不用再动；None=锚点没对上，算失败
+
+    group=True 时（匹配到很多同名的文件，比如 43 份 strings.xml）把日志合并成
+    一行，避免刷屏；失败的文件仍会逐个列出来。
+    """
     hits = glob.glob(rel, recursive=True)
     if not hits:
         print(f"  ✗ 没找到文件 {rel}")
         if required:
             FAILS.append(f"{rel}（文件不存在）")
         return False
-    ok = False
+
+    # group=True 时把 fn 自己 print 的明细（"删掉死字符串: ..."）接管下来，
+    # 只在最后回显前几条，避免 44 个文件刷出 44 行一模一样的日志。
+    import contextlib, io as _io
+    seen = []
+
+    def run(s):
+        if not group:
+            return fn(s), None
+        buf = _io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            out = fn(s)
+        return out, buf.getvalue()
+
+    done = skipped = failed = 0
     for p in hits:
         s = open(p).read()
-        out = fn(s)
+        out, logged = run(s)
         if out is SKIP:
-            # 具体原因（已定制过 / 上游已无此功能）由各函数自己打印过了
-            print(f"  · {os.path.basename(p)}: 无需改动，跳过")
-            ok = True
-            continue
-        if out is None:
-            print(f"  ✗ {os.path.basename(p)}: 锚点没对上，{label} 未生效")
+            skipped += 1
+        elif out is None:
+            failed += 1
+            seen.append(f"  ✗ {os.path.basename(p)}: 锚点没对上，{label} 未生效")
             if required:
                 FAILS.append(f"{os.path.basename(p)}: {label}")
-            continue
-        open(p, "w").write(out)
-        print(f"  ✓ {os.path.basename(p)}: {label}")
-        ok = True
-    return ok
+        else:
+            open(p, "w").write(out)
+            done += 1
+            if logged and logged not in seen:
+                seen.append(logged)
+
+    if group:
+        name = os.path.basename(hits[0])
+        parts = []
+        if done:
+            parts.append(f"改了 {done} 个")
+        if skipped:
+            parts.append(f"跳过 {skipped} 个")
+        if failed:
+            parts.append(f"失败 {failed} 个")
+        print(f"  ✓ {name} × {len(hits)}: {label}（{'，'.join(parts)}）")
+        for l in seen[:3]:
+            print(l.rstrip("\n"))
+    elif skipped and not done and not failed:
+        # 具体原因（已定制过 / 上游已无此功能）由各函数自己打印过了
+        print(f"  · {os.path.basename(hits[0])}: 无需改动，跳过")
+    return done > 0
 
 
 # ---------------------------------------------------------------- 括号配对工具
@@ -592,19 +625,45 @@ DEAD_STRINGS = [
     "enable_web_debugging_summary",
     "send_log",                                # 发送日志（整块已删）
     "save_log",
+    "log_saved",                               # 只被删掉的那句 logSavedMessage 用过
 ]
+
+# 注：源码里另外还有 30 来条上游自己的孤儿字符串（kpm_version、apm_version 等），
+# 那是上游遗留，跟本次改动无关，不动它们——批量删风险大于收益。
+
+
+def build_reference_corpus():
+    """把所有可能引用 @string / R.string 的地方拼在一起。
+
+    必须扫整个 res/ 而不只是 res/xml：字符串还可能被 drawable、mipmap 快捷方式、
+    menu、以及其它 values 文件（<item>@string/x</item>）引用。
+    漏扫 = 删掉还在被引用的字符串 = 构建直接挂，宁可多扫。
+    """
+    corpus = ""
+    for p in glob.glob(f"{APP}/java/**/*.kt", recursive=True):
+        corpus += open(p).read()
+    for p in glob.glob(f"{APP}/res/**/*.xml", recursive=True):
+        corpus += open(p).read()
+    for p in glob.glob(f"{APP}/AndroidManifest.xml"):
+        corpus += open(p).read()
+    return corpus
+
+
+_REFERENCES = None
+
+
+def is_referenced(name):
+    global _REFERENCES
+    if _REFERENCES is None:
+        _REFERENCES = build_reference_corpus()
+    return (re.search(r"R\.string\." + name + r"\b", _REFERENCES) is not None
+            or re.search(r"@string/" + name + r"\b", _REFERENCES) is not None)
 
 
 def dead_strings(s):
-    code = ""
-    for p in glob.glob(f"{APP}/java/**/*.kt", recursive=True):
-        code += open(p).read()
-    for p in glob.glob(f"{APP}/res/xml/*.xml") + glob.glob(f"{APP}/AndroidManifest.xml"):
-        code += open(p).read()
     removed = []
     for name in DEAD_STRINGS:
-        if re.search(r"R\.string\." + name + r"\b", code) or \
-           re.search(r"@string/" + name + r"\b", code):
+        if is_referenced(name):
             continue
         pat = re.compile(r"[ \t]*<string name=\"" + name + r"\".*?</string>\n", re.S)
         s, cnt = pat.subn("", s)
@@ -617,7 +676,10 @@ def dead_strings(s):
     return s
 
 
-edit(f"{APP}/res/values/strings.xml", dead_strings, "清理已关功能遗留的字符串", required=False)
+# 所有语言的 strings.xml 都清一遍：App 锁的是 zh-CN，实际显示用的是
+# values-zh-rCN 那份，只清默认的 values 会留下看不出、但确实存在的死资源。
+edit(f"{APP}/res/values*/strings.xml", dead_strings,
+     "清理已关功能遗留的字符串（含其它语言）", required=False, group=True)
 
 
 # ---------------------------------------------------------------- 5. 语言只留中文
