@@ -708,23 +708,22 @@ edit(f"{APP}/java/**/APatchApp.kt", applocale, "App 启动锁定简体中文")
 
 
 # ---------------------------------------------------------------- 7. 只打中文资源
-def locale_filters(s):
-    if "localeFilters" in s:
+# ⚠ 别用 localeFilters 这条 DSL：实测 AGP 9.3.1 会把它原样喂给 aapt2 的 -c 参数，
+#   而 -c 只认老式资源限定符（zh / zh-rCN），传 BCP-47 的 "zh-CN" 会直接构建失败：
+#     error: invalid config 'zh-CN' for -c option.
+#   Execution failed for task ':app:generateReleaseLocaleConfig'
+# 语言目录在上面第 5.5 步已经物理删掉了，localeFilters 属于多余，不加。
+# 这里只做一件事：万一之前有人手动加过，把它清掉，避免再次踩坑。
+def drop_locale_filters(s):
+    if "localeFilters" not in s:
         return SKIP
-    old = "    androidResources {\n        generateLocaleConfig = true\n    }"
-    if old not in s:
-        print("      ⚠ 没找到 androidResources 块，跳过（不影响其它改动）")
-        return None
-    return s.replace(
-        old,
-        "    androidResources {\n"
-        "        generateLocaleConfig = true\n"
-        "        // 定制：只打中文，其余 40 多种语言资源不进包\n"
-        '        localeFilters += "zh-CN"\n'
-        "    }")
+    # 连带吃掉它上面紧邻的注释行；闭合括号那行的缩进原样保留
+    out = re.sub(r"(?:[ \t]*//[^\n]*\n)*[ \t]*localeFilters[^\n]*\n", "", s)
+    print("      · 清掉手动加的 localeFilters（会破坏构建）")
+    return out
 
 
-edit("app/build.gradle.kts", locale_filters, "打包只保留中文资源", required=False)
+edit("app/build.gradle.kts", drop_locale_filters, "清理会破坏构建的 localeFilters", required=False)
 
 
 # ---------------------------------------------------------------- 8. 终态校验
@@ -826,7 +825,7 @@ echo -n " KPM 图标(应为 Settings): "; grep -A4 '    KModule(' "$BB" 2>/dev/n
 echo -n " 语言项(应为2): "; grep -c '<item>' app/src/main/res/values/arrays.xml 2>/dev/null
 echo -n " 剩余语言目录(应为0，只留 values/night/zh-rCN): "
 ls -d app/src/main/res/values-* 2>/dev/null | grep -vE 'values-night$|values-zh-rCN$' | wc -l
-echo -n " 只打中文资源: "; grep -c 'localeFilters' app/build.gradle.kts 2>/dev/null
+echo -n " localeFilters残留(应为0，它会让构建失败): "; grep -c 'localeFilters' app/build.gradle.kts 2>/dev/null
 echo -n " WebView调试残留(应为0): "; grep -rl 'getBoolean("enable_web_debugging"' app/src/main/java 2>/dev/null | wc -l
 echo -n " 反馈入口残留(应为0): "; grep -rl 'home_more_menu_feedback_or_suggestion' app/src/main/java 2>/dev/null | wc -l
 echo -n " 发送日志残留(应为0): "; grep -rl 'showLogBottomSheet' app/src/main/java 2>/dev/null | wc -l
