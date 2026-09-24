@@ -671,6 +671,55 @@ else:
     print("  ✓ res/: 其它语言目录已清理过，跳过")
 
 
+# ---------------------------------------------------------------- 5.6 系统「应用语言」页只列中文
+# 上面改的 arrays.xml 只管 App 内部那个语言选择器。
+# 手机系统设置里「应用 → 该应用 → 语言」那一页是另一套机制：它列的是
+# APK 支持的 locale，由 AGP 的 generateLocaleConfig 自动扫描 res 生成，
+# 不受 arrays.xml 影响 —— 所以光删目录，那一页还是会列出英文等。
+# 要让它也只剩中文，必须显式给一份 locale_config.xml 并在 manifest 里引用。
+LOCALE_CONFIG = '''<?xml version="1.0" encoding="utf-8"?>
+<locale-config xmlns:android="http://schemas.android.com/apk/res/android">
+    <!-- 定制：只支持简体中文，系统「应用语言」页就只列出这一项 -->
+    <locale android:name="zh-CN"/>
+</locale-config>
+'''
+
+_xml_dir = f"{APP}/res/xml"
+os.makedirs(_xml_dir, exist_ok=True)
+_lp = os.path.join(_xml_dir, "locale_config.xml")
+if os.path.exists(_lp) and "zh-CN" in open(_lp).read():
+    print("  · locale_config.xml: 已存在且正确，跳过")
+else:
+    open(_lp, "w").write(LOCALE_CONFIG)
+    print("  ✓ locale_config.xml: 系统「应用语言」页只列简体中文")
+
+
+def add_locale_config_attr(s):
+    if "android:localeConfig" in s:
+        return SKIP
+    m = re.search(r"<application\b", s)
+    if not m:
+        return None
+    return (s[:m.end()] + '\n        android:localeConfig="@xml/locale_config"'
+            + s[m.end():])
+
+
+edit(f"{APP}/AndroidManifest.xml", add_locale_config_attr, "manifest 引用 locale_config")
+
+
+def disable_auto_locale_config(s):
+    """关掉 AGP 自动扫描生成：它会把扫描结果也写进 APK，跟上面那份打架"""
+    if "generateLocaleConfig = false" in s:
+        return SKIP
+    if "generateLocaleConfig" not in s:
+        return None
+    return s.replace("generateLocaleConfig = true", "generateLocaleConfig = false")
+
+
+edit("app/build.gradle.kts", disable_auto_locale_config,
+     "关闭 AGP 自动生成 locale_config", required=False)
+
+
 # ---------------------------------------------------------------- 6. 启动即中文
 LOCALE_CODE = '''    // 定制：不跟随系统语言，启动即锁定简体中文。
     // 想恢复「跟随系统」，把整个 attachBaseContext + withChineseLocale 删掉即可。
@@ -791,6 +840,19 @@ def final_check():
     app = read_one(f"{APP}/java/**/APatchApp.kt")
     need(app is None or "withChineseLocale" in app, "App 没有锁定简体中文")
 
+    mf = read_one(f"{APP}/AndroidManifest.xml")
+    need(mf is None or "android:localeConfig" in mf,
+         "manifest 没有引用 locale_config（系统「应用语言」页不会只列中文）")
+    lc = read_one(f"{APP}/res/xml/locale_config.xml")
+    # 注意：不能用 "<locale" 计数，它会连 <locale-config> 根标签一起数进去
+    need(lc is not None and "zh-CN" in lc
+         and lc.count("<locale android:name") == 1,
+         "locale_config.xml 不是只含 zh-CN 一项")
+    ag = read_one("app/build.gradle.kts")
+    if ag is not None and "generateLocaleConfig" in ag:
+        need("generateLocaleConfig = false" in ag,
+             "AGP 自动生成 locale_config 没关掉（会跟上面那份打架）")
+
     return bad
 
 
@@ -825,6 +887,8 @@ echo -n " KPM 图标(应为 Settings): "; grep -A4 '    KModule(' "$BB" 2>/dev/n
 echo -n " 语言项(应为2): "; grep -c '<item>' app/src/main/res/values/arrays.xml 2>/dev/null
 echo -n " 剩余语言目录(应为0，只留 values/night/zh-rCN): "
 ls -d app/src/main/res/values-* 2>/dev/null | grep -vE 'values-night$|values-zh-rCN$' | wc -l
+echo -n " manifest引用locale_config(应为1): "; grep -c 'android:localeConfig' app/src/main/AndroidManifest.xml 2>/dev/null
+echo -n " AGP自动生成locale_config(应为0): "; grep -c 'generateLocaleConfig = true' app/build.gradle.kts 2>/dev/null
 echo -n " localeFilters残留(应为0，它会让构建失败): "; grep -c 'localeFilters' app/build.gradle.kts 2>/dev/null
 echo -n " WebView调试残留(应为0): "; grep -rl 'getBoolean("enable_web_debugging"' app/src/main/java 2>/dev/null | wc -l
 echo -n " 反馈入口残留(应为0): "; grep -rl 'home_more_menu_feedback_or_suggestion' app/src/main/java 2>/dev/null | wc -l
