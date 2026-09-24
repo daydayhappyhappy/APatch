@@ -11,8 +11,16 @@
 #   4. 关掉三项：反馈和建议、WebView 调试、发送日志
 #   5. 语言列表只留简体中文，并让 App 启动时就锁中文（不跟随系统语言）
 #   6. 剔除改完后失效的 import / 变量 / 字符串 / 其它语言资源
+#   7. 固定 APK 显示版本号为 1.0（不跟 git 短哈希走）
 #
 # 脚本是幂等的：重复执行不会叠加破坏，第二次跑只会提示"已定制过，跳过"。
+#
+# 版本号想改的话，改下面这个，或跑的时候临时覆盖：
+#   PIN_VERSION_NAME=1.1 bash ui_customize.sh
+#
+# 注意只固定 versionName（界面显示用，如「1.0」）。
+#   versionCode（内部数字，10200 + commit 数）保持不动——它每次提交 +1，
+#   正好保证新包永远能覆盖安装旧包；改成固定值反而会装不上。
 #
 # 上游更新后的行为：
 #   默认【严格模式】——任何一项没命中，脚本最后以退出码 1 结束，CI 这一步会变红。
@@ -29,12 +37,14 @@ echo " UI 定制：底栏 3 项 / 设置进溢出菜单 / 关反馈、Web调试�
 echo "=========================================="
 
 ALLOW_MISS="${ALLOW_MISS:-0}"
+PIN_VERSION_NAME="${PIN_VERSION_NAME:-1.0}"
 
-python3 - "$ALLOW_MISS" <<'PY'
+python3 - "$ALLOW_MISS" "$PIN_VERSION_NAME" <<'PY'
 import glob, os, re, sys
 
 APP = "app/src/main"
 ALLOW_MISS = sys.argv[1] == "1"
+PIN_VERSION_NAME = sys.argv[2]
 FAILS = []
 
 
@@ -837,6 +847,72 @@ def drop_locale_filters(s):
 edit("app/build.gradle.kts", drop_locale_filters, "清理会破坏构建的 localeFilters", required=False)
 
 
+# ---------------------------------------------------------------- 7.5 固定显示版本号
+# versionName 上游取 `git rev-parse --short HEAD`，每提交一次就换一串短哈希，
+# 「关于」页和 APK 文件名都会带着它。这里固定成 1.0 这类标准版本号。
+#
+# 只动 versionName。versionCode（10200 + commit 数）必须保持不动：
+# 它每次提交 +1，正好保证新包永远能覆盖安装旧包；改成固定值反而会装不上。
+
+VER_CONST = ('// 定制：固定显示版本号（versionName），与 app 保持一致\n'
+             f'const PINNED_VERSION_NAME: &str = "{PIN_VERSION_NAME}";\n\n')
+
+
+def pin_version_name_gradle(s):
+    """app 的 versionName：把 `return getGitDescribe()` 换成固定字符串"""
+    pat = re.compile(
+        r'fun getVersionName\(\): String \{\s*return getGitDescribe\(\)\s*\}', re.S)
+    if pat.search(s):
+        s = pat.sub(
+            'fun getVersionName(): String {\n'
+            '    // 定制：固定显示版本号，不用 git 短哈希\n'
+            f'    return "{PIN_VERSION_NAME}"\n'
+            '}', s)
+        # getGitDescribe() 现在没人调用了。确认全文只剩它自己的定义才删，
+        # 别处还引用就留着（宁可留个死函数，也别删出编译错误）。
+        if s.count("getGitDescribe") == 1:
+            s2 = re.sub(r"fun getGitDescribe\(\): String \{.*?\}\n\n?", "", s, flags=re.S)
+            if "getGitDescribe" not in s2:
+                s = s2
+                print("      · 顺带删掉已无人调用的 getGitDescribe()")
+        return s
+    # 已经固定成目标值？
+    if re.search(r'fun getVersionName\(\): String \{\s*//[^\n]*\n\s*return "'
+                 + re.escape(PIN_VERSION_NAME) + r'"\s*\}', s):
+        return SKIP
+    print("      ⚠ getVersionName() 结构变了（上游可能改了写法）")
+    return None
+
+
+edit("build.gradle.kts", pin_version_name_gradle, "固定 app 显示版本号")
+
+
+def pin_version_name_apd(s):
+    """apd 的版本名（`apd -V`、模块环境变量 APATCH_VER），跟 app 保持一致"""
+    if f'PINNED_VERSION_NAME: &str = "{PIN_VERSION_NAME}"' in s:
+        return SKIP
+    old = '''    let (code, name) = match get_git_version() {
+        Ok((code, name)) => (code, name),'''
+    if old not in s:
+        print("      ⚠ apd/build.rs 的版本匹配块结构变了，跳过（不影响 app 版本号）")
+        return None
+    new = '''    let (code, name) = match get_git_version() {
+        // 定制：固定显示版本号，不再用 git describe 的输出
+        Ok((code, _)) => (code, PINNED_VERSION_NAME.to_string()),'''
+    s = s.replace(old, new)
+    s = s.replace('(0, "0.0.0".to_string())', '(0, PINNED_VERSION_NAME.to_string())')
+    s = s.replace('using 0.0.0', f'using pinned {PIN_VERSION_NAME}')
+    anchor = "fn get_git_version()"
+    if anchor in s:
+        s = s.replace(anchor, VER_CONST + anchor, 1)
+    else:
+        s = VER_CONST + s
+    return s
+
+
+edit("apd/build.rs", pin_version_name_apd, "固定 apd 显示版本号", required=False)
+
+
 # ---------------------------------------------------------------- 8. 终态校验
 # 过程不重要，只看「最终状态达没达成」。
 # 上游把某个功能删了 -> 终态自然达成，脚本自己认，不需要人工改脚本。
@@ -915,6 +991,19 @@ def final_check():
         need("generateLocaleConfig = false" in ag,
              "AGP 自动生成 locale_config 没关掉（会跟上面那份打架）")
 
+    gradle = read_one("build.gradle.kts")
+    if gradle is not None:
+        need(f'return "{PIN_VERSION_NAME}"' in gradle,
+             f"versionName 没有固定成 {PIN_VERSION_NAME}")
+        # versionCode 必须继续跟着 commit 数递增，固定住会导致新包装不上旧包
+        need("getGitCommitCount()" in gradle,
+             "versionCode 不再跟着 commit 数递增（会导致无法覆盖安装）")
+
+    apd = read_one("apd/build.rs")
+    if apd is not None:
+        need(PIN_VERSION_NAME in apd,
+             f"apd 的版本名没有同步成 {PIN_VERSION_NAME}")
+
     return bad
 
 
@@ -956,6 +1045,9 @@ echo -n " WebView调试残留(应为0): "; grep -rl 'getBoolean("enable_web_debu
 echo -n " 反馈入口残留(应为0): "; grep -rl 'home_more_menu_feedback_or_suggestion' app/src/main/java 2>/dev/null | wc -l
 echo -n " 发送日志残留(应为0): "; grep -rl 'showLogBottomSheet' app/src/main/java 2>/dev/null | wc -l
 echo -n " 死字符串残留(应为0): "; grep -c 'home_more_menu_feedback_or_suggestion\|enable_web_debugging\|send_log\|save_log' app/src/main/res/values/strings.xml 2>/dev/null
+echo -n " 显示版本号(应为 $PIN_VERSION_NAME): "
+grep -A2 'fun getVersionName' build.gradle.kts 2>/dev/null | grep -oE '"[^"]+"' | head -1
+echo -n " versionCode仍递增(应>0): "; grep -c 'getGitCommitCount()' build.gradle.kts 2>/dev/null
 echo
 echo " 各文件失效 import 复查："
 for f in $(find app/src/main/java -name 'BottomBarDestination.kt' -o -name 'Home.kt' -o -name 'Settings.kt' -o -name 'APatchApp.kt' -o -name 'WebUIActivity.kt' 2>/dev/null); do
@@ -983,4 +1075,5 @@ echo " 设置：主页右上角 ⋮ 菜单"
 echo " 关于：设置页最下方"
 echo " 已关：反馈和建议 / WebView 调试 / 发送日志"
 echo " 语言：只留简体中文，不跟随系统"
+echo " 版本号：显示 $PIN_VERSION_NAME（versionCode 仍随提交递增，保证能覆盖安装）"
 echo "=========================================="
