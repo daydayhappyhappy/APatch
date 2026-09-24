@@ -33,7 +33,7 @@
     <string name="settings_global_namespace_mode">全局命名空间模式</string>
     <string name="settings_global_namespace_mode_summary">所有 Root 会话均使用全局挂载命名空间</string>
     <string name="settings_sucompat">旧版 SU 兼容</string>
-    <string name="settings_sucompat_summary">适用于 SU 不生效</string>
+    <string name="settings_sucompat_summary">适用于 SU 不生效的情况</string>
     <string name="settings_selinux_hide">隐藏 SELinux 修改</string>
     <string name="settings_selinux_hide_summary">可有效通过用户进程的检测</string>
     <string name="settings_selinux_hide_warning_title">警告</string>
