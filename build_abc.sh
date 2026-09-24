@@ -88,8 +88,64 @@ done
 # （zipalign + apksigner --v1 false --v2 true --v3 false --v4 false）重签并自检。
 echo "[6/7] 签名交给 sign_v2_only.sh，gradle 阶段不处理"
 
-# ---------- 7. 验证 ----------
-echo "[7/7] 验证..."
+# ---------- 7. 关掉官方更新检查 ----------
+# Downloader.kt:57 硬编码 https://api.github.com/repos/bmax121/APatch/releases/latest
+# 这个 URL 不含包名，上面的替换碰不到它。官方版装上来会提示升级、覆盖成官方 APK。
+# 设置里的开关默认 true，且存在 SharedPreferences 里（重装会重置），所以直接改源码默认值。
+echo "[7/8] 关闭并隐藏官方更新检查 / KPM 只保留「加载」..."
+# 注意：第 2 步已把源码目录迁到新包名下，这里必须用 find 现找
+python3 - <<'PY'
+import re, glob, os
+
+def edit(rel, fn):
+    hits = glob.glob(rel, recursive=True)
+    if not hits:
+        print(f"  ⚠ 没找到 {rel}")
+        return
+    for p in hits:
+        s = open(p).read()
+        n = fn(s)
+        if n is None:
+            print(f"  ⚠ {os.path.basename(p)}: 没匹配到，跳过")
+            continue
+        open(p, "w").write(n)
+        print(f"  ✓ {os.path.basename(p)}")
+
+# --- 1) 更新检查：默认关 ---
+def off_update(s):
+    return s.replace('getBoolean("check_update", true)', 'getBoolean("check_update", false)') \
+            .replace('getBoolean(key, true)', 'getBoolean(key, false)')
+edit("app/src/main/java/**/ui/screen/Home.kt", off_update)
+edit("app/src/main/java/**/ui/screen/Settings.kt", off_update)
+
+# --- 2) 隐藏设置里的 Check Update 开关 ---
+def drop_switch(s):
+    i = s.find("// Check Update")
+    if i < 0:
+        return None
+    j = s.find("checkUpdate = it", i)
+    if j < 0:
+        return None
+    k = s.find("\n", j)
+    end = s.find("}", k)
+    if end < 0:
+        return None
+    # 吃掉结尾换行，不留空行
+    e = s.find("\n", end)
+    return s[:i] + s[e + 1:]
+edit("app/src/main/java/**/ui/screen/Settings.kt", drop_switch)
+
+# --- 3) KPM 添加方式只留「加载」，隐藏镶嵌与安装 ---
+def kpm_only_load(s):
+    old = "val options = listOf(moduleEmbed, moduleInstall, moduleLoad)"
+    if old not in s:
+        return None
+    return s.replace(old, "val options = listOf(moduleLoad)")
+edit("app/src/main/java/**/ui/screen/KPM.kt", kpm_only_load)
+PY
+
+# ---------- 8. 验证 ----------
+echo "[8/8] 验证..."
 set +e
 for pat in "$OLD_PKG" "$OLD_PKG_SLASH" "$OLD_PKG_UNDER"; do
     n=$(grep -rIl "$pat" "${TARGETS[@]}" 2>/dev/null | grep -v "${SKIP_DIRS[@]}" | wc -l)
@@ -103,4 +159,6 @@ echo " 1) 用固定 keystore 签名（不要每次 keytool 新建）"
 echo " 2) keytool -list -v -keystore xxx.keystore 取证书 SHA-256"
 echo " 3) 把该 SHA-256 填进 KernelPatch kernel/patch/android/userd.c 的 trusted_managers[]"
 echo " 4) 自己编译 KernelPatch（APatch 默认下载的是官方预编译 kpimg，里面写死官方包名+摘要）"
+echo
+echo " 已顺手关掉官方更新检查（Home.kt / Settings.kt 默认 false）"
 echo "=========================================="
