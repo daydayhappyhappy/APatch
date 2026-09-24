@@ -14,7 +14,7 @@ jobs:
       # ⚠️ 不要用 com.android.* / com.google.* / android.* / com.example.* —— 保留前缀
       NEW_PKG: com.abc.manager
       NEW_NAME: ABC
-      KP_VERSION: 0.13.8        # 必须和 app/src/main/cpp/version 里的版本一致
+      KP_VERSION: 0.13.9        # 必须和 app/src/main/cpp/version 里的版本一致
       HAS_KEY: ${{ secrets.SIGNING_KEY != '' }}
       KEY_STORE_PASSWORD: ${{ secrets.KEY_STORE_PASSWORD }}
       KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
